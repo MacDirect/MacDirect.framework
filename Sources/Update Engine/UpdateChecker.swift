@@ -16,15 +16,23 @@ public struct UpdateInfo: Codable {
 @MainActor
 class UpdateChecker {
     func check(feedURL: URL) async throws -> UpdateInfo? {
-        let (data, _) = try await URLSession.shared.data(from: feedURL)
+        print("[UpdateChecker] Fetching feed from: \(feedURL)")
+        let (data, response) = try await URLSession.shared.data(from: feedURL)
+        
+        if let httpResponse = response as? HTTPURLResponse {
+            print("[UpdateChecker] HTTP Status: \(httpResponse.statusCode)")
+        }
         
         // This mirrors the UpdateFeed struct but for client consumption
         // We define a local private struct to parse the full feed first
         let feed = try JSONDecoder().decode(ClientUpdateFeed.self, from: data)
+        print("[UpdateChecker] Latest version in feed: \(feed.latestVersion.version)")
         
         let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
+        print("[UpdateChecker] Current app version: \(currentVersion)")
         
         if compareVersions(feed.latestVersion.version, isGreaterThan: currentVersion) {
+            print("[UpdateChecker] Update AVAILABLE: \(feed.latestVersion.version)")
             return UpdateInfo(
                 version: feed.latestVersion.version,
                 releaseNotes: feed.latestVersion.releaseNotes,
@@ -32,6 +40,7 @@ class UpdateChecker {
             )
         }
         
+        print("[UpdateChecker] No update needed.")
         return nil
     }
     

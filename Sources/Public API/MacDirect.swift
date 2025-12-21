@@ -22,9 +22,9 @@ public final class MacDirect: NSObject {
         }
         LocalState.shared.feedURL = url
         
-        // Sandbox Warning
+        // Sandbox Check (Informational)
         if isSandboxed() {
-             print("⚠️ [MacDirect] WARNING: App Sandbox detected. Standard update mechanism (atomic swap) WILL NOT WORK without a specialized Helper Tool. Ensure you have configured the Helper or use this for Direct Distribution only.")
+             print("[MacDirect] App Sandbox detected. Using Helper Tool for safe updates.")
         }
         
         print("[MacDirect] Configured with feed: \(url)")
@@ -47,18 +47,47 @@ public final class MacDirect: NSObject {
     /// Presents the standard update UI if an update is available.
     @MainActor
     @objc public static func presentUpdateProfileIfAvailable() {
+        print("[MacDirect] Automatically checking for updates...")
         Task {
             do {
                 if let update = try await checkForUpdates() {
-                    // In a real framework, we'd use NSWindow/NSAlert or a ViewModifier
-                    // For MVP, we'll print to console or try to find key window
                     print("[MacDirect] Update available: \(update.version)")
                     presentUpdateWindow(for: update)
                 } else {
                     print("[MacDirect] No updates available.")
                 }
             } catch {
-                print("[MacDirect] Update check failed: \(error)")
+                print("[MacDirect] Automatic update check failed: \(error)")
+            }
+        }
+    }
+    
+    /// Checks for updates manually and showing UI feedback even if no update is found.
+    @MainActor
+    @objc public static func checkForUpdatesManually() {
+        print("[MacDirect] Manually checking for updates...")
+        Task {
+            do {
+                if let update = try await checkForUpdates() {
+                    print("[MacDirect] Update available: \(update.version)")
+                    presentUpdateWindow(for: update)
+                } else {
+                    print("[MacDirect] No updates available.")
+                    let alert = NSAlert()
+                    alert.messageText = "You're up to date!"
+                    alert.informativeText = "\(Bundle.main.infoDictionary?["CFBundleName"] as? String ?? "This app") \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "") is the latest version."
+                    alert.alertStyle = .informational
+                    alert.addButton(withTitle: "OK")
+                    alert.runModal()
+                }
+            } catch {
+                print("[MacDirect] Manual update check failed: \(error)")
+                let alert = NSAlert()
+                alert.messageText = "Check for Updates Failed"
+                alert.informativeText = "There was an error checking for updates: \(error.localizedDescription)"
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
             }
         }
     }
@@ -67,11 +96,12 @@ public final class MacDirect: NSObject {
     private static func presentUpdateWindow(for update: UpdateInfo) {
         let alert = UpdateAlert(update: update)
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 500, height: 300),
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 320),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
+        window.title = "Software Update"
         window.center()
         window.contentView = NSHostingView(rootView: alert)
         window.makeKeyAndOrderFront(nil)

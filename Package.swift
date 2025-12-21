@@ -14,13 +14,22 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "MacDirect",
+            name: "MacDirectSecurity",
             dependencies: [],
+            path: "Sources/MacDirectSecurity"
+        ),
+        .target(
+            name: "MacDirect",
+            dependencies: ["MacDirectSecurity"],
             path: "Sources",
-            exclude: ["UpdateHelper"]
+            exclude: ["UpdateHelper", "MacDirectSecurity", "Resources"],
+            resources: [
+                .copy("Resources/MacDirectUpdater.app")
+            ]
         ),
         .executableTarget(
-            name: "MacDirectUpdateHelper",
+            name: "MacDirectUpdater",
+            dependencies: ["MacDirectSecurity"],
             path: "Sources/UpdateHelper"
         )
     ]

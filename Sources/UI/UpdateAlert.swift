@@ -11,7 +11,9 @@ struct UpdateAlert: View {
     let update: UpdateInfo
     @StateObject private var downloadManager = DownloadManager.shared
     @State private var isDownloading: Bool = false
+    @State private var isReadyToInstall: Bool = false
     @State private var isInstalling: Bool = false
+    @State private var downloadedDMGURL: URL?
     @State private var errorMessage: String?
     
     var body: some View {
@@ -46,7 +48,19 @@ struct UpdateAlert: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                .frame(height: 150) // Maintain layout height
+                .frame(height: 150)
+            } else if isReadyToInstall {
+                VStack(spacing: 8) {
+                    Image(systemName: "arrow.down.circle.fill")
+                        .font(.system(size: 48))
+                        .foregroundStyle(.green)
+                    Text("Update Downloaded")
+                        .font(.title3)
+                    Text("The application will restart to complete the update.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: 150)
             } else {
                 ScrollView {
                     Text(update.releaseNotes)
@@ -59,24 +73,35 @@ struct UpdateAlert: View {
                 Button("Skip This Version") {
                     NSApp.keyWindow?.close()
                 }
-                .disabled(isDownloading)
+                .disabled(isDownloading || isInstalling)
                 
                 Spacer()
                 
-                if !isDownloading && !isInstalling {
+                if isReadyToInstall {
+                    Button("Install on Quit") {
+                        // TODO: Persist intent to install on quit
+                        NSApp.keyWindow?.close()
+                    }
+                    
+                    Button("Restart & Install") {
+                        performInstall()
+                    }
+                    .buttonStyle(.borderedProminent)
+                } else if !isDownloading && !isInstalling {
                     Button("Remind Me Later") {
                         NSApp.keyWindow?.close()
                     }
                     
                     Button("Install Update") {
-                        startUpdate()
+                        startDownload()
                     }
                     .buttonStyle(.borderedProminent)
                 } else {
                     Button("Cancel") {
-                        // Cancel logic (not implemented in DownloadManager yet)
+                        // Cancel logic
                         NSApp.keyWindow?.close()
                     }
+                    .disabled(isInstalling)
                 }
             }
         }
@@ -84,7 +109,7 @@ struct UpdateAlert: View {
         .frame(width: 500, height: 320)
     }
     
-    private func startUpdate() {
+    private func startDownload() {
         let url = update.downloadURL
         isDownloading = true
         errorMessage = nil
@@ -94,17 +119,30 @@ struct UpdateAlert: View {
                 let dmgLocation = try await downloadManager.downloadUpdate(from: url)
                 
                 await MainActor.run {
-                    isDownloading = false
-                    isInstalling = true
+                    self.downloadedDMGURL = dmgLocation
+                    self.isDownloading = false
+                    self.isReadyToInstall = true
                 }
-                
-                try await UpdateInstaller.install(dmgURL: dmgLocation)
-                // App should restart here
             } catch {
                 await MainActor.run {
-                    isDownloading = false
-                    isInstalling = false
-                    errorMessage = error.localizedDescription
+                    self.isDownloading = false
+                    self.errorMessage = error.localizedDescription
+                }
+            }
+        }
+    }
+    
+    private func performInstall() {
+        guard let dmgURL = downloadedDMGURL else { return }
+        
+        isInstalling = true
+        Task {
+            do {
+                try await UpdateInstaller.install(dmgURL: dmgURL)
+            } catch {
+                await MainActor.run {
+                    self.isInstalling = false
+                    self.errorMessage = error.localizedDescription
                 }
             }
         }

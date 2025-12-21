@@ -271,13 +271,44 @@ class UpdaterDelegate: NSObject, NSApplicationDelegate {
     func finishAndRelaunch(target: URL) {
         log("Relaunching: \(target.path)")
         
-        let config = NSWorkspace.OpenConfiguration()
-        config.createsNewApplicationInstance = true
+        // Step 1: Remove quarantine attribute from the new app
+        // This is often set on apps extracted from DMGs
+        let xattrTask = Process()
+        xattrTask.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
+        xattrTask.arguments = ["-rd", "com.apple.quarantine", target.path]
+        try? xattrTask.run()
+        xattrTask.waitUntilExit()
+        log("Quarantine attribute removed (exit code: \(xattrTask.terminationStatus))")
         
-        NSWorkspace.shared.openApplication(at: target, configuration: config) { _, error in
-            if let error = error { log("Relaunch Error: \(error)") }
-            DispatchQueue.main.async { NSApp.terminate(nil) }
+        // Step 2: Small delay to let LaunchServices update its database
+        Thread.sleep(forTimeInterval: 0.5)
+        
+        // Step 3: Use /usr/bin/open which is more reliable for launching swapped apps
+        // NSWorkspace.openApplication can fail with code signing issues on replaced apps
+        let openTask = Process()
+        openTask.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        openTask.arguments = ["-a", target.path]
+        
+        do {
+            try openTask.run()
+            openTask.waitUntilExit()
+            
+            if openTask.terminationStatus == 0 {
+                log("Relaunch successful via /usr/bin/open")
+            } else {
+                log("Relaunch via open failed with status: \(openTask.terminationStatus)")
+                // Fallback: Try NSWorkspace
+                let config = NSWorkspace.OpenConfiguration()
+                config.createsNewApplicationInstance = true
+                NSWorkspace.shared.openApplication(at: target, configuration: config) { _, error in
+                    if let error = error { log("Fallback relaunch error: \(error)") }
+                }
+            }
+        } catch {
+            log("Failed to run open command: \(error)")
         }
+        
+        DispatchQueue.main.async { NSApp.terminate(nil) }
     }
     
     // Helpers

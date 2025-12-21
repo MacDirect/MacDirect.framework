@@ -21,7 +21,18 @@ public final class MacDirect: NSObject {
             return
         }
         LocalState.shared.feedURL = url
+        
+        // Sandbox Warning
+        if isSandboxed() {
+             print("⚠️ [MacDirect] WARNING: App Sandbox detected. Standard update mechanism (atomic swap) WILL NOT WORK without a specialized Helper Tool. Ensure you have configured the Helper or use this for Direct Distribution only.")
+        }
+        
         print("[MacDirect] Configured with feed: \(url)")
+    }
+    
+    private static func isSandboxed() -> Bool {
+        let environment = ProcessInfo.processInfo.environment
+        return environment["APP_SANDBOX_CONTAINER_ID"] != nil
     }
     
     /// Manually checks for updates.

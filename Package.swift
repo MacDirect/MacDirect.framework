@@ -16,7 +16,12 @@ let package = Package(
         .target(
             name: "MacDirect",
             dependencies: [],
-            path: "Sources"
+            path: "Sources",
+            exclude: ["UpdateHelper"]
+        ),
+        .executableTarget(
+            name: "MacDirectUpdateHelper",
+            path: "Sources/UpdateHelper"
         )
     ]
 )

@@ -33,31 +33,52 @@ class UpdateInstaller {
             throw InstallError.helperNotFound
         }
         
-        // 2. Launch via NSWorkspace (LaunchServices)
-        // launching directly from the bundle bypasses quarantine issues associated with copying.
-        
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
-        configuration.createsNewApplicationInstance = true
-        
-        // Note: The helper itself is responsible for copying itself to a temporary location
-        // if it needs to survive the main app's termination/replacement.
-        // But for the launch itself, we start from the verified bundle location.
+        // 2. Write Configuration File
+        // The `open --args` mechanism is unreliable for passing arguments to GUI apps
+        // launched via LaunchServices in sandboxed contexts. Instead, we write a config
+        // file to a known location that the helper can read on startup.
         
         let pid = ProcessInfo.processInfo.processIdentifier
-        configuration.arguments = [
-            "-dmg", dmgURL.path,
-            "-dest", destination.path,
-            "-pid", String(pid),
-            "-mode", "dmg"
+        let config: [String: Any] = [
+            "dmg": dmgURL.path,
+            "dest": destination.path,
+            "pid": pid,
+            "mode": "dmg"
         ]
         
-        print("[UpdateInstaller] Launching via NSWorkspace (In-Place): \(originalHelperURL.path)")
-        print("[UpdateInstaller] Args: \(configuration.arguments)")
+        // Write to the sandboxed app's container temp directory
+        // The helper will discover the container path from the host app's bundle identifier
+        let hostBundleId = Bundle.main.bundleIdentifier ?? "unknown"
+        let configURL = FileManager.default.temporaryDirectory.appendingPathComponent("MacDirectUpdaterConfig.plist")
         
-        try await NSWorkspace.shared.openApplication(at: originalHelperURL, configuration: configuration)
+        // Include the host bundle ID so the helper can find the container if needed
+        var configWithMeta = config
+        configWithMeta["hostBundleId"] = hostBundleId
+        let configData = try PropertyListSerialization.data(fromPropertyList: configWithMeta, format: .xml, options: 0)
+        try configData.write(to: configURL)
         
-        print("[UpdateInstaller] NSWorkspace openApplication returned successfully. Terminating host app...")
+        print("[UpdateInstaller] Config written to: \(configURL.path)")
+        
+        // 3. Launch via /usr/bin/open
+        let openTask = Process()
+        openTask.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        openTask.arguments = [
+            "-n", // Open a new instance even if one is running
+            "-a", originalHelperURL.path // Path to the application
+        ]
+        
+        // Also set environment variable pointing to config (backup mechanism)
+        var env = ProcessInfo.processInfo.environment
+        env["MACDIRECT_CONFIG_PATH"] = configURL.path
+        openTask.environment = env
+        
+        print("[UpdateInstaller] Launching via /usr/bin/open: \(originalHelperURL.path)")
+        print("[UpdateInstaller] Cmd: open \(openTask.arguments?.joined(separator: " ") ?? "")")
+        
+        try openTask.run()
+        openTask.waitUntilExit()
+        
+        print("[UpdateInstaller] 'open' command completed. Terminating host app...")
         
         // Give the helper a moment to actually start before we kill ourselves
         try await Task.sleep(nanoseconds: 1 * 1_000_000_000)

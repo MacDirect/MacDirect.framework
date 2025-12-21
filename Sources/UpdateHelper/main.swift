@@ -27,20 +27,96 @@ class UpdaterDelegate: NSObject, NSApplicationDelegate {
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         let rawArgs = ProcessInfo.processInfo.arguments
+        let env = ProcessInfo.processInfo.environment
+        
         log("Updater started from: \(Bundle.main.bundlePath)")
         log("Raw Arguments: \(rawArgs)")
         
-        // 2. Parse Arguments
-        // 'open --args' usually populates UserDefaults.standard
-        let defaults = UserDefaults.standard
+        // 2. Parse Arguments - Multiple fallback mechanisms
+        var destPath: String?
+        var pid: Int32 = 0
+        var dmgPath: String?
         
-        var destPath = defaults.string(forKey: "dest")
-        var pid = Int32(defaults.integer(forKey: "pid"))
-        var dmgPath = defaults.string(forKey: "dmg")
+        // Priority 1: Config File (Most Robust - works reliably from sandboxed apps)
+        // The helper is embedded in the host app, so we can discover the host's container
+        // by parsing our own bundle path to find the host app's bundle identifier
         
-        // Fallback: Manual Parse (If UserDefaults fails for any reason)
+        var configPaths: [URL] = []
+        
+        // Try to discover host app's container from our bundle path
+        // Path looks like: .../Dummy1.app/Contents/Resources/MacDirect_MacDirect.bundle/.../MacDirectUpdater.app
+        let bundlePath = Bundle.main.bundlePath
+        log("Helper bundle path: \(bundlePath)")
+        
+        if let hostAppPath = extractHostAppPath(from: bundlePath) {
+            log("Discovered host app: \(hostAppPath)")
+            
+            // Read host app's Info.plist to get bundle identifier
+            let hostInfoPlistPath = hostAppPath + "/Contents/Info.plist"
+            if let hostInfoDict = NSDictionary(contentsOfFile: hostInfoPlistPath),
+               let hostBundleId = hostInfoDict["CFBundleIdentifier"] as? String {
+                log("Host bundle identifier: \(hostBundleId)")
+                
+                // Build path to host's container tmp
+                let containerConfigPath = FileManager.default.homeDirectoryForCurrentUser
+                    .appendingPathComponent("Library/Containers")
+                    .appendingPathComponent(hostBundleId)
+                    .appendingPathComponent("Data/tmp/MacDirectUpdaterConfig.plist")
+                configPaths.append(containerConfigPath)
+                log("Looking for config at: \(containerConfigPath.path)")
+            }
+        }
+        
+        // Also check standard temp directories as fallback
+        configPaths.append(contentsOf: [
+            FileManager.default.temporaryDirectory.appendingPathComponent("MacDirectUpdaterConfig.plist"),
+            URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("MacDirectUpdaterConfig.plist"),
+            URL(fileURLWithPath: "/private/tmp/MacDirectUpdaterConfig.plist")
+        ])
+        
+        // Also check path from environment variable if set
+        if let envConfigPath = env["MACDIRECT_CONFIG_PATH"] {
+            let envConfigURL = URL(fileURLWithPath: envConfigPath)
+            if loadConfig(from: envConfigURL, destPath: &destPath, pid: &pid, dmgPath: &dmgPath) {
+                log("Configuration loaded from env path: \(envConfigPath)")
+            }
+        }
+        
         if destPath == nil {
-            log("UserDefaults empty. Attempting manual argument parsing.")
+            for configURL in configPaths {
+                log("Checking config path: \(configURL.path)")
+                if loadConfig(from: configURL, destPath: &destPath, pid: &pid, dmgPath: &dmgPath) {
+                    log("Configuration loaded from config file: \(configURL.path)")
+                    break
+                }
+            }
+        }
+        
+        // Priority 2: Environment Variables (backup)
+        if destPath == nil {
+            destPath = env["MACDIRECT_DEST_PATH"]
+            pid = Int32(env["MACDIRECT_PID"] ?? "0") ?? 0
+            dmgPath = env["MACDIRECT_DMG_PATH"]
+            if destPath != nil {
+                log("Configuration loaded from Environment Variables.")
+            }
+        }
+        
+        // Priority 3: UserDefaults (Standard 'open --args' mechanism)
+        if destPath == nil {
+            let defaults = UserDefaults.standard
+            destPath = defaults.string(forKey: "dest")
+            if let p = defaults.string(forKey: "pid") { pid = Int32(p) ?? 0 }
+            else { pid = Int32(defaults.integer(forKey: "pid")) }
+            dmgPath = defaults.string(forKey: "dmg")
+            if destPath != nil {
+                log("Configuration loaded from UserDefaults.")
+            }
+        }
+
+        // Priority 4: Manual Parse (Fallback)
+        if destPath == nil {
+            log("Attempting manual argument parsing...")
             var i = 0
             while i < rawArgs.count {
                 let arg = rawArgs[i]
@@ -52,6 +128,9 @@ class UpdaterDelegate: NSObject, NSApplicationDelegate {
                     dmgPath = rawArgs[i+1]
                 }
                 i += 1
+            }
+            if destPath != nil {
+                log("Configuration loaded from command-line arguments.")
             }
         }
         
@@ -226,6 +305,48 @@ class UpdaterDelegate: NSObject, NSApplicationDelegate {
     func findApp(in folder: URL) -> URL? {
         let contents = try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)
         return contents?.first { $0.pathExtension == "app" }
+    }
+    
+    func loadConfig(from url: URL, destPath: inout String?, pid: inout Int32, dmgPath: inout String?) -> Bool {
+        guard FileManager.default.fileExists(atPath: url.path),
+              let data = try? Data(contentsOf: url),
+              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else {
+            return false
+        }
+        
+        destPath = plist["dest"] as? String
+        dmgPath = plist["dmg"] as? String
+        if let pidValue = plist["pid"] as? Int {
+            pid = Int32(pidValue)
+        } else if let pidString = plist["pid"] as? String {
+            pid = Int32(pidString) ?? 0
+        }
+        
+        // Clean up the config file after reading to avoid stale data
+        try? FileManager.default.removeItem(at: url)
+        
+        return destPath != nil && dmgPath != nil && pid > 0
+    }
+    
+    /// Extracts the host app path from the helper's bundle path
+    /// The helper is embedded like: .../HostApp.app/Contents/Resources/.../MacDirectUpdater.app
+    /// We want to find the first .app in the path (which is the host app)
+    func extractHostAppPath(from helperPath: String) -> String? {
+        // Split the path and find the first component ending with .app
+        let components = helperPath.components(separatedBy: "/")
+        var pathSoFar = ""
+        
+        for component in components {
+            if component.isEmpty { continue }
+            pathSoFar += "/" + component
+            
+            // Check if this is an .app but NOT our own updater app
+            if component.hasSuffix(".app") && !component.contains("MacDirectUpdater") {
+                return pathSoFar
+            }
+        }
+        
+        return nil
     }
 }
 

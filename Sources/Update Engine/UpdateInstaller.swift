@@ -6,22 +6,169 @@ class UpdateInstaller {
     enum InstallError: Error {
         case mountingFailed
         case appNotFoundInDMG
-        case signatureVerificationFailed(Error)
+        case signatureVerificationFailed(AppError)
         case helperNotFound
         case helperLaunchFailed(String)
         case helperCopyFailed(String)
+        case zipExtractionFailed
+        case appNotFoundInZip
     }
     
-    static func install(dmgURL: URL) async throws {
-        print("[UpdateInstaller] Installing from: \(dmgURL.path)")
+    static func install(artifactURL: URL) async throws {
+        print("[UpdateInstaller] Installing from: \(artifactURL.path)")
         
         let destinationURL = Bundle.main.bundleURL
         
+        // Determine mode
+        let mode: String
+        switch artifactURL.pathExtension.lowercased() {
+        case "dmg": mode = "dmg"
+        case "zip": mode = "zip"
+        case "pkg": mode = "pkg"
+        case "app": mode = "app"
+        default: mode = "dmg" // Fallback
+        }
+        
+        // SECURITY: Verify Team ID before proceeding with installation
+        // This is the "MacDirect" equivalent of Sparkle's SUPublicEDKey verification
+        try await verifyTeamIDMatch(artifactURL: artifactURL, mode: mode)
+        
         // Launch Helper
-        try await launchHelper(dmgURL: dmgURL, destination: destinationURL)
+        try await launchHelper(artifactURL: artifactURL, destination: destinationURL, mode: mode)
     }
     
-    private static func launchHelper(dmgURL: URL, destination: URL) async throws {
+    /// Verifies that the update is signed by the same developer as the current app.
+    private static func verifyTeamIDMatch(artifactURL: URL, mode: String) async throws {
+        print("[UpdateInstaller] Verifying Team ID match...")
+        
+        // Get the Team ID of the CURRENT running app
+        let currentTeamID = try await CodeSignVerifier.getTeamID(at: Bundle.main.bundleURL)
+        print("[UpdateInstaller] Current app Team ID: \(currentTeamID)")
+        
+        let newAppTeamID: String
+        
+        switch mode {
+        case "dmg":
+            // Mount DMG, find app, get Team ID, unmount
+            let (mountPoint, tempAppURL) = try await mountDMGAndFindApp(dmgURL: artifactURL)
+            defer {
+                // Unmount the DMG
+                let unmountProcess = Process()
+                unmountProcess.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+                unmountProcess.arguments = ["detach", mountPoint.path, "-quiet"]
+                try? unmountProcess.run()
+                unmountProcess.waitUntilExit()
+            }
+            newAppTeamID = try await CodeSignVerifier.getTeamID(at: tempAppURL)
+            
+        case "zip":
+            // Extract ZIP, find app, get Team ID, cleanup
+            let (extractDir, tempAppURL) = try await extractZipAndFindApp(zipURL: artifactURL)
+            defer {
+                // Cleanup extracted directory
+                try? FileManager.default.removeItem(at: extractDir)
+            }
+            newAppTeamID = try await CodeSignVerifier.getTeamID(at: tempAppURL)
+            
+        case "app":
+            // Direct app bundle
+            newAppTeamID = try await CodeSignVerifier.getTeamID(at: artifactURL)
+            
+        case "pkg":
+            // PKG verification is handled differently - skip for now
+            // The PKG installer itself should be signed
+            print("[UpdateInstaller] PKG mode - Team ID verification delegated to system installer")
+            return
+            
+        default:
+            print("[UpdateInstaller] Unknown mode - skipping Team ID verification")
+            return
+        }
+        
+        print("[UpdateInstaller] Update app Team ID: \(newAppTeamID)")
+        
+        guard currentTeamID == newAppTeamID else {
+            throw InstallError.signatureVerificationFailed(
+                AppError(
+                    title: "Security Alert",
+                    description: "The update is not signed by the same developer. Update aborted.\n\nExpected Team ID: \(currentTeamID)\nActual Team ID: \(newAppTeamID)"
+                )
+            )
+        }
+        
+        print("[UpdateInstaller] ✅ Team ID verification passed")
+    }
+    
+    /// Mounts a DMG and finds the .app inside it.
+    private static func mountDMGAndFindApp(dmgURL: URL) async throws -> (mountPoint: URL, appURL: URL) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+        process.arguments = ["attach", dmgURL.path, "-nobrowse", "-readonly", "-plist"]
+        
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        
+        try process.run()
+        process.waitUntilExit()
+        
+        guard process.terminationStatus == 0 else {
+            throw InstallError.mountingFailed
+        }
+        
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
+              let entities = plist["system-entities"] as? [[String: Any]] else {
+            throw InstallError.mountingFailed
+        }
+        
+        // Find the mount point
+        var mountPoint: URL?
+        for entity in entities {
+            if let mount = entity["mount-point"] as? String {
+                mountPoint = URL(fileURLWithPath: mount)
+                break
+            }
+        }
+        
+        guard let mount = mountPoint else {
+            throw InstallError.mountingFailed
+        }
+        
+        // Find .app in mount point
+        let contents = try FileManager.default.contentsOfDirectory(at: mount, includingPropertiesForKeys: nil)
+        guard let appURL = contents.first(where: { $0.pathExtension == "app" }) else {
+            throw InstallError.appNotFoundInDMG
+        }
+        
+        return (mount, appURL)
+    }
+    
+    /// Extracts a ZIP and finds the .app inside it.
+    private static func extractZipAndFindApp(zipURL: URL) async throws -> (extractDir: URL, appURL: URL) {
+        let extractDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true)
+        
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        process.arguments = ["-q", zipURL.path, "-d", extractDir.path]
+        
+        try process.run()
+        process.waitUntilExit()
+        
+        guard process.terminationStatus == 0 else {
+            throw InstallError.zipExtractionFailed
+        }
+        
+        // Find .app in extracted directory
+        let contents = try FileManager.default.contentsOfDirectory(at: extractDir, includingPropertiesForKeys: nil)
+        guard let appURL = contents.first(where: { $0.pathExtension == "app" }) else {
+            throw InstallError.appNotFoundInZip
+        }
+        
+        return (extractDir, appURL)
+    }
+    
+    private static func launchHelper(artifactURL: URL, destination: URL, mode: String) async throws {
         // 1. Locate Helper
         #if SWIFT_PACKAGE
         let bundle = Bundle.module
@@ -40,10 +187,10 @@ class UpdateInstaller {
         
         let pid = ProcessInfo.processInfo.processIdentifier
         let config: [String: Any] = [
-            "dmg": dmgURL.path,
+            "artifact": artifactURL.path,
             "dest": destination.path,
             "pid": pid,
-            "mode": "dmg"
+            "mode": mode
         ]
         
         // Write to the sandboxed app's container temp directory

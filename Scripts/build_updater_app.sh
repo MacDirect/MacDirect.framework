@@ -29,12 +29,23 @@ cp "$FRAMEWORK_ROOT/Sources/UpdateHelper/Info.plist" "$OUTPUT_DIR/$UPDATER_APP_N
 chmod +x "$OUTPUT_DIR/$UPDATER_APP_NAME/Contents/MacOS/$UPDATER_BINARY_NAME"
 
 # Code Sign
-# We sign with - (ad-hoc) or a specific identity if available. 
-# Ideally, for the framework distribution, we sign with proper entitlements.
-# When the consumer archives, Xcode will re-sign, preserving these entitlements.
+# Automatically detect Developer ID Application certificate for proper notarization support.
+# Falls back to ad-hoc signing (-) if no Developer ID is found.
+# When the consumer archives, Xcode will re-sign with their own identity.
 echo "Signing MacDirectUpdater.app..."
 ENTITLEMENTS="$FRAMEWORK_ROOT/Sources/UpdateHelper/MacDirectUpdater.entitlements"
-codesign --force --options runtime --deep --sign - --entitlements "$ENTITLEMENTS" "$OUTPUT_DIR/$UPDATER_APP_NAME"
+
+# Find Developer ID Application certificate
+SIGNING_IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+
+if [ -z "$SIGNING_IDENTITY" ]; then
+    echo "No Developer ID Application certificate found, using ad-hoc signing."
+    SIGNING_IDENTITY="-"
+else
+    echo "Found signing identity: $SIGNING_IDENTITY"
+fi
+
+codesign --force --options runtime --deep --sign "$SIGNING_IDENTITY" --entitlements "$ENTITLEMENTS" "$OUTPUT_DIR/$UPDATER_APP_NAME"
 
 echo "MacDirectUpdater.app created and signed at $OUTPUT_DIR/$UPDATER_APP_NAME"
 echo "Done."

@@ -2,10 +2,15 @@ import AppKit
 import MacDirectSecurity
 
 // 1. Logging Helper
-// Writes to a log file on the Desktop for debugging visibility.
+// Writes to ~/Library/Logs/MacDirect/ which is the standard macOS log location
 func log(_ message: String) {
-    let logURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop/MacDirectUpdater.log")
+    let logsDir = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/MacDirect")
+    let logURL = logsDir.appendingPathComponent("MacDirectUpdater.log")
     let entry = "[\(Date().ISO8601Format())] \(message)\n"
+    
+    // Ensure logs directory exists
+    try? FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
     
     if let data = entry.data(using: .utf8) {
         if FileManager.default.fileExists(atPath: logURL.path) {
@@ -35,7 +40,8 @@ class UpdaterDelegate: NSObject, NSApplicationDelegate {
         // 2. Parse Arguments - Multiple fallback mechanisms
         var destPath: String?
         var pid: Int32 = 0
-        var dmgPath: String?
+        var artifactPath: String?
+        var mode: String?
         
         // Priority 1: Config File (Most Robust - works reliably from sandboxed apps)
         // The helper is embedded in the host app, so we can discover the host's container
@@ -77,7 +83,7 @@ class UpdaterDelegate: NSObject, NSApplicationDelegate {
         // Also check path from environment variable if set
         if let envConfigPath = env["MACDIRECT_CONFIG_PATH"] {
             let envConfigURL = URL(fileURLWithPath: envConfigPath)
-            if loadConfig(from: envConfigURL, destPath: &destPath, pid: &pid, dmgPath: &dmgPath) {
+            if loadConfig(from: envConfigURL, destPath: &destPath, pid: &pid, artifactPath: &artifactPath, mode: &mode) {
                 log("Configuration loaded from env path: \(envConfigPath)")
             }
         }
@@ -85,7 +91,7 @@ class UpdaterDelegate: NSObject, NSApplicationDelegate {
         if destPath == nil {
             for configURL in configPaths {
                 log("Checking config path: \(configURL.path)")
-                if loadConfig(from: configURL, destPath: &destPath, pid: &pid, dmgPath: &dmgPath) {
+                if loadConfig(from: configURL, destPath: &destPath, pid: &pid, artifactPath: &artifactPath, mode: &mode) {
                     log("Configuration loaded from config file: \(configURL.path)")
                     break
                 }
@@ -96,7 +102,7 @@ class UpdaterDelegate: NSObject, NSApplicationDelegate {
         if destPath == nil {
             destPath = env["MACDIRECT_DEST_PATH"]
             pid = Int32(env["MACDIRECT_PID"] ?? "0") ?? 0
-            dmgPath = env["MACDIRECT_DMG_PATH"]
+            artifactPath = env["MACDIRECT_DMG_PATH"]
             if destPath != nil {
                 log("Configuration loaded from Environment Variables.")
             }
@@ -108,7 +114,7 @@ class UpdaterDelegate: NSObject, NSApplicationDelegate {
             destPath = defaults.string(forKey: "dest")
             if let p = defaults.string(forKey: "pid") { pid = Int32(p) ?? 0 }
             else { pid = Int32(defaults.integer(forKey: "pid")) }
-            dmgPath = defaults.string(forKey: "dmg")
+            artifactPath = defaults.string(forKey: "dmg")
             if destPath != nil {
                 log("Configuration loaded from UserDefaults.")
             }
@@ -125,7 +131,7 @@ class UpdaterDelegate: NSObject, NSApplicationDelegate {
                 } else if (arg == "-pid" || arg == "--pid") && i+1 < rawArgs.count {
                     pid = Int32(rawArgs[i+1]) ?? 0
                 } else if (arg == "-dmg" || arg == "--dmg") && i+1 < rawArgs.count {
-                    dmgPath = rawArgs[i+1]
+                    artifactPath = rawArgs[i+1]
                 }
                 i += 1
             }
@@ -134,9 +140,9 @@ class UpdaterDelegate: NSObject, NSApplicationDelegate {
             }
         }
         
-        log("Configuration: dest=\(destPath ?? "nil"), pid=\(pid), dmg=\(dmgPath ?? "nil")")
+        log("Configuration: dest=\(destPath ?? "nil"), pid=\(pid), artifact=\(artifactPath ?? "nil"), mode=\(mode ?? "nil")")
         
-        guard let destination = destPath, pid > 0, let dmg = dmgPath else {
+        guard let destination = destPath, pid > 0, let artifact = artifactPath else {
             log("CRITICAL: Missing required arguments. Terminating.")
             NSApp.terminate(nil)
             return
@@ -144,49 +150,72 @@ class UpdaterDelegate: NSObject, NSApplicationDelegate {
         
         // 3. Execute Update Task
         Task {
-            await performUpdateSequence(dmgPath: dmg, destination: destination, pid: pid)
+            await performUpdateSequence(artifactPath: artifact, destination: destination, pid: pid, mode: mode)
         }
     }
     
-    func performUpdateSequence(dmgPath: String, destination: String, pid: Int32) async {
+    func performUpdateSequence(artifactPath: String, destination: String, pid: Int32, mode: String?) async {
         // Step A: Wait for Parent App to Quit
         log("Step 1: Waiting for Parent PID \(pid) to exit...")
         await waitForParent(pid: pid)
         
         do {
-            let dmgURL = URL(fileURLWithPath: dmgPath)
+            let artifactURL = URL(fileURLWithPath: artifactPath)
+            let determinedMode = mode ?? artifactURL.pathExtension.lowercased()
             
-            // Step B: Mount DMG
-            log("Step 2: Mounting DMG...")
-            let mountPoint = try await mountDMG(at: dmgURL)
-            log("Mounted at: \(mountPoint.path)")
+            var sourceAppURL: URL?
             
-            defer {
-                log("Cleanup: Detaching DMG...")
-                let task = Process()
-                task.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
-                task.arguments = ["detach", mountPoint.path, "-force"]
-                try? task.run()
-                task.waitUntilExit()
+            if determinedMode == "dmg" {
+                // Step B: Mount DMG
+                log("Step 2: Mounting DMG...")
+                let mountPoint = try await mountDMG(at: artifactURL)
+                log("Mounted at: \(mountPoint.path)")
+                
+                defer {
+                    log("Cleanup: Detaching DMG...")
+                    let task = Process()
+                    task.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+                    task.arguments = ["detach", mountPoint.path, "-force"]
+                    try? task.run()
+                    task.waitUntilExit()
+                }
+                
+                // Step C: Find App in DMG
+                log("Step 3: Locating .app in DMG...")
+                sourceAppURL = findApp(in: mountPoint)
+            } else if determinedMode == "zip" {
+                log("Step 2: Extracting ZIP...")
+                let stagingDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+                try await extractZIP(at: artifactURL, to: stagingDir)
+                sourceAppURL = findApp(in: stagingDir)
+            } else if determinedMode == "pkg" {
+                log("Step 2: Installing PKG...")
+                // PKG updates are handled differently as they usually install themselves to /Applications
+                // But we still might want to relaunch the app from the destination
+                try await installPKG(at: artifactURL)
+                log("PKG Installation triggered.")
+                finishAndRelaunch(target: URL(fileURLWithPath: destination))
+                return
+            } else if determinedMode == "app" {
+                log("Step 2: Using direct .app artifact...")
+                sourceAppURL = artifactURL
             }
             
-            // Step C: Find App in DMG
-            log("Step 3: Locating .app in DMG...")
-            guard let sourceAppURL = findApp(in: mountPoint) else {
-                log("Error: No .app found in DMG")
+            guard let finalSourceAppURL = sourceAppURL else {
+                log("Error: No .app found in artifact (\(determinedMode))")
                 NSApp.terminate(nil)
                 return
             }
-            log("Found: \(sourceAppURL.path)")
+            log("Source app: \(finalSourceAppURL.path)")
             
-            // Step D: Extract to Temp (Atomic Prep)
-            // We copy from DMG to a temp folder first to ensure we aren't reading from the DMG while writing
-            log("Step 4: Extracting to Staging...")
+            // Step D: Extract to Temp (Atomic Prep) if not already in staging
             let stagingDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: stagingDir, withIntermediateDirectories: true)
-            let stagedAppURL = stagingDir.appendingPathComponent(sourceAppURL.lastPathComponent)
+            let stagedAppURL = stagingDir.appendingPathComponent(finalSourceAppURL.lastPathComponent)
             
-            try FileManager.default.copyItem(at: sourceAppURL, to: stagedAppURL)
+            log("Step 4: Staging app for swap...")
+            try FileManager.default.copyItem(at: finalSourceAppURL, to: stagedAppURL)
             
             // Step E: Perform Swap
             log("Step 5: Performing Swap...")
@@ -338,7 +367,7 @@ class UpdaterDelegate: NSObject, NSApplicationDelegate {
         return contents?.first { $0.pathExtension == "app" }
     }
     
-    func loadConfig(from url: URL, destPath: inout String?, pid: inout Int32, dmgPath: inout String?) -> Bool {
+    func loadConfig(from url: URL, destPath: inout String?, pid: inout Int32, artifactPath: inout String?, mode: inout String?) -> Bool {
         guard FileManager.default.fileExists(atPath: url.path),
               let data = try? Data(contentsOf: url),
               let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else {
@@ -346,7 +375,9 @@ class UpdaterDelegate: NSObject, NSApplicationDelegate {
         }
         
         destPath = plist["dest"] as? String
-        dmgPath = plist["dmg"] as? String
+        artifactPath = plist["artifact"] as? String ?? plist["dmg"] as? String // Backwards compat
+        mode = plist["mode"] as? String
+        
         if let pidValue = plist["pid"] as? Int {
             pid = Int32(pidValue)
         } else if let pidString = plist["pid"] as? String {
@@ -356,7 +387,32 @@ class UpdaterDelegate: NSObject, NSApplicationDelegate {
         // Clean up the config file after reading to avoid stale data
         try? FileManager.default.removeItem(at: url)
         
-        return destPath != nil && dmgPath != nil && pid > 0
+        return destPath != nil && artifactPath != nil && pid > 0
+    }
+    
+    func extractZIP(at url: URL, to destination: URL) async throws {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        task.arguments = ["-q", url.path, "-d", destination.path]
+        try task.run()
+        task.waitUntilExit()
+        if task.terminationStatus != 0 {
+            throw NSError(domain: "Updater", code: 3, userInfo: [NSLocalizedDescriptionKey: "Unzip failed"])
+        }
+    }
+    
+    func installPKG(at url: URL) async throws {
+        // pkg installation requires root for /Applications usually
+        let script = "installer -pkg \"\(url.path)\" -target /"
+        let appleScript = "do shell script \"\(script)\" with administrator privileges"
+        
+        var error: NSDictionary?
+        if let scriptObject = NSAppleScript(source: appleScript) {
+            scriptObject.executeAndReturnError(&error)
+            if let error = error {
+                throw NSError(domain: "Updater", code: 4, userInfo: error as? [String : Any])
+            }
+        }
     }
     
     /// Extracts the host app path from the helper's bundle path

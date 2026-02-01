@@ -138,7 +138,7 @@ struct UpdateAlert: View {
         isInstalling = true
         Task {
             do {
-                try await UpdateInstaller.install(dmgURL: dmgURL)
+                try await UpdateInstaller.install(artifactURL: dmgURL)
             } catch {
                 await MainActor.run {
                     self.isInstalling = false

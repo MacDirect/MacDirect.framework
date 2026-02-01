@@ -22,7 +22,7 @@ let package = Package(
             name: "MacDirect",
             dependencies: ["MacDirectSecurity"],
             path: "Sources",
-            exclude: ["UpdateHelper", "MacDirectSecurity", "Resources"],
+            exclude: ["UpdateHelper", "MacDirectSecurity"],
             resources: [
                 .copy("Resources/MacDirectUpdater.app")
             ]
